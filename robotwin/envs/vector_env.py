@@ -46,21 +46,27 @@ def class_decorator(task_name):
 
 
 def update_obs(observation):
-    full_image = observation["observation"]["head_camera"]["rgb"]
-    left_wrist_image = (
-        observation["observation"].get("left_camera", {}).get("rgb", None)
-    )
-    right_wrist_image = (
-        observation["observation"].get("right_camera", {}).get("rgb", None)
-    )
-    state = observation["joint_action"]["vector"]
+    """Return raw RoboTwin obs plus legacy flattened aliases.
 
-    return {
-        "full_image": full_image,
-        "left_wrist_image": left_wrist_image,
-        "right_wrist_image": right_wrist_image,
-        "state": state,
-    }
+    Returned dict keeps the original fields from ``task.get_obs()`` such as
+    ``observation``, ``pointcloud``, ``joint_action`` and ``endpose``, and also
+    adds the older compatibility keys:
+    - ``full_image``: head camera RGB image
+    - ``left_wrist_image`` / ``right_wrist_image``: wrist camera RGB images
+    - ``state``: alias of ``joint_action["vector"]``
+    """
+    obs = dict(observation)
+    camera_obs = observation.get("observation", {})
+    joint_action = observation.get("joint_action", {})
+
+    # Keep the raw RoboTwin observation structure while restoring the flattened
+    # aliases that older callers still consume.
+    obs["full_image"] = camera_obs.get("head_camera", {}).get("rgb", None)
+    obs["left_wrist_image"] = camera_obs.get("left_camera", {}).get("rgb", None)
+    obs["right_wrist_image"] = camera_obs.get("right_camera", {}).get("rgb", None)
+    obs["state"] = joint_action.get("vector", None)
+
+    return obs
 
 
 class SubEnv:
@@ -81,6 +87,7 @@ class SubEnv:
             self.env_seed = self.env_id
         self.instruction = None
         self.task = class_decorator(self.task_name)
+        self.action_type = self.args.get("action_type", "qpos")
         self.instruction_type = instruction_type
         self.global_lock = global_lock
         self.lock = threading.Lock()
@@ -136,6 +143,53 @@ class SubEnv:
             "info": info,
         }
 
+    def chunk_step(self, actions):
+        if self.get_instruction() is None:
+            self.reset(env_seed=None)
+
+        with self.lock:
+            if self.action_type in ("ee", "delta_ee"):
+                chunk_rewards = []
+                chunk_terminations = []
+                chunk_truncations = []
+                chunk_observations = []
+
+                for action in actions:
+                    self.task.take_action(action, action_type=self.action_type)
+
+                    step_success = bool(getattr(self.task, "eval_success", False))
+                    step_truncation = bool(
+                        self.task.take_action_cnt >= self.task.step_lim and not step_success
+                    )
+
+                    obs = self.task.get_obs()
+                    obs["instruction"] = self.task.get_instruction()
+                    chunk_observations.append(obs)
+                    chunk_rewards.append(float(step_success))
+                    chunk_terminations.append(int(step_success))
+                    chunk_truncations.append(int(step_truncation))
+
+                obs_list = chunk_observations
+                reward = np.asarray(chunk_rewards, dtype=np.float32)
+                termination = np.asarray(chunk_terminations, dtype=np.int32)
+                truncation = np.asarray(chunk_truncations, dtype=np.int32)
+                info = {"success": bool(getattr(self.task, "eval_success", False))}
+            else:
+                reward, termination, truncation, info = self.task.gen_sparse_reward_data(
+                    actions, action_type=self.action_type
+                )
+                obs = self.task.get_obs()
+                obs["instruction"] = self.task.get_instruction()
+                obs_list = [obs]
+
+        return {
+            "obs": obs_list,
+            "reward": reward,
+            "terminated": termination,
+            "truncated": truncation,
+            "info": info,
+        }
+
     def reset(self, env_seed=None):
         with self.global_lock:
             with self.lock:
@@ -176,8 +230,7 @@ class SubEnv:
 
     def get_obs(self):
         with self.lock:
-            obs = self.task.get_obs()
-            obs = update_obs(obs)
+            obs = update_obs(self.task.get_obs())
             obs["instruction"] = self.task.get_instruction()
 
         return obs
@@ -363,6 +416,91 @@ class VectorEnv(gym.Env):
                 results.append(result)
             except Exception as e:
                 raise RuntimeError(f"SubEnv {i} step error: {e}")
+
+        obs_venv, reward_venv, terminated_venv, truncated_venv, info_venv = (
+            self.transform(results)
+        )
+
+        return obs_venv, reward_venv, terminated_venv, truncated_venv, info_venv
+
+    def chunk_step(self, actions):
+        """Step all sub-envs with a chunk of actions.
+
+        Args:
+            actions: Per-env action chunks. Expected shape is typically
+                ``[n_envs, chunk_step, action_dim]``. Each ``actions[i]`` is passed
+                to ``SubEnv.chunk_step()`` for env ``i``.
+
+        Returns:
+            A 5-tuple ``(obs_venv, reward_venv, terminated_venv, truncated_venv,
+            info_venv)`` where each item is grouped by env.
+
+            - ``obs_venv``:
+              ``list[list[dict]]`` with shape roughly ``[n_envs][chunk_step]``.
+              ``obs_venv[i]`` is the chunk observation list for env ``i`` and
+              ``obs_venv[i][t]`` is the raw RoboTwin observation after chunk step
+              ``t``.
+
+              Each observation dict keeps the original RoboTwin task fields:
+              - ``observation``: per-camera observation dict. Each camera entry
+                may contain camera config and image-like outputs such as:
+                - ``intrinsic_cv``
+                - ``extrinsic_cv``
+                - ``cam2world_gl``
+                - ``rgb``
+                - optional ``depth``
+                - optional ``mesh_segmentation``
+                - optional ``actor_segmentation``
+              - ``pointcloud``: point cloud returned by the task if enabled
+              - ``joint_action``: proprio/joint state dict, commonly including
+                ``left_arm``, ``left_gripper``, ``right_arm``, ``right_gripper``,
+                and ``vector``
+              - ``endpose``: end-effector pose dict, commonly including
+                ``left_endpose``, ``left_gripper``, ``right_endpose``,
+                and ``right_gripper``
+              - optional ``third_view_rgb``: observer-camera RGB image if enabled
+              - ``instruction``: language instruction for the current episode
+
+              Note: unlike ``step()``, ``chunk_step()`` intentionally returns the
+              raw task observations and does not flatten them through
+              ``update_obs()``.
+
+            - ``reward_venv``:
+              ``list[np.ndarray | list[float]]`` grouped by env. For ee-style
+              chunk stepping this is usually length-``chunk_step`` reward data per
+              env; for qpos it may be a single-step-style value wrapped per env by
+              ``transform()``.
+
+            - ``terminated_venv``:
+              Per-env termination outputs. For ee chunk stepping this is usually a
+              chunk-length sequence indicating whether each chunk sub-step ended
+              the episode.
+
+            - ``truncated_venv``:
+              Per-env truncation outputs. For ee chunk stepping this is usually a
+              chunk-length sequence indicating whether each chunk sub-step hit the
+              step limit.
+
+            - ``info_venv``:
+              ``list[dict]`` grouped by env after ``transform()``. Each env keeps
+              its own info dict from ``SubEnv.chunk_step()``.
+        """
+        if len(self.envs) == 0:
+            self._init_envs()
+
+        step_futures = {}
+        for i in range(self.n_envs):
+            future = self.env_thread_pool.submit(self.envs[i].chunk_step, actions[i])
+            step_futures[i] = future
+
+        results = []
+        for i in range(self.n_envs):
+            future = step_futures[i]
+            try:
+                result = future.result(timeout=120)
+                results.append(result)
+            except Exception as e:
+                raise RuntimeError(f"SubEnv {i} chunk_step error: {e}")
 
         obs_venv, reward_venv, terminated_venv, truncated_venv, info_venv = (
             self.transform(results)
