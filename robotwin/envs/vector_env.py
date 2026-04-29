@@ -230,7 +230,7 @@ class SubEnv:
 
     def get_obs(self):
         with self.lock:
-            obs = update_obs(self.task.get_obs())
+            obs = self.task.get_obs()
             obs["instruction"] = self.task.get_instruction()
 
         return obs
